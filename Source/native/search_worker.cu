@@ -4,6 +4,25 @@
 // Runtime publication uses the existing phase0 source protocol, not network credit.
 #include "exact_prime_proof.h"
 #include <cuda_runtime.h>
+
+#if CUDART_VERSION >= 13000
+// CUDA 13 inserted an edge-data argument before the dependency count. No edge data is described
+// here, so the shim keeps the call sites identical across toolchains.
+static inline cudaError_t scout_graph_add_node(cudaGraphNode_t *node, cudaGraph_t graph,
+                                               const cudaGraphNode_t *dependencies,
+                                               size_t count, cudaGraphNodeParams *params)
+{
+    return cudaGraphAddNode(node, graph, dependencies, nullptr, count, params);
+}
+#else
+static inline cudaError_t scout_graph_add_node(cudaGraphNode_t *node, cudaGraph_t graph,
+                                               const cudaGraphNode_t *dependencies,
+                                               size_t count, cudaGraphNodeParams *params)
+{
+    return cudaGraphAddNode(node, graph, dependencies, count, params);
+}
+#endif
+
 #include "resident_runtime.h"
 #include "resident_protocol.h"
 #include "portable_platform.h"
@@ -1286,7 +1305,7 @@ static int pgnWorkerMain(int argc, char **argv) {
             params.kernel.blockDim = dim3(512);
             params.kernel.sharedMemBytes = 65536;
             params.kernel.kernelParams = args;
-            return cudaGraphAddNode(node, target, nullptr, 0, &params);
+            return scout_graph_add_node(node, target, nullptr, 0, &params);
         };
         cudaGraphNode_t first{}, loopNode{}, walk{}, proof{}, nextMark{}, advance{};
         CHECK(mark(graph, &zero, &first));
@@ -1295,7 +1314,7 @@ static int pgnWorkerMain(int argc, char **argv) {
         loop.conditional.handle = handle;
         loop.conditional.type = cudaGraphCondTypeWhile;
         loop.conditional.size = 1;
-        CHECK(cudaGraphAddNode(&loopNode, graph, &first, 1, &loop));
+        CHECK(scout_graph_add_node(&loopNode, graph, &first, 1, &loop));
         const auto body = loop.conditional.phGraph_out[0];
         void *args[] = {&d_descriptors, &laneState, &buffers, &zero};
         cudaGraphNodeParams work{};
@@ -1304,11 +1323,11 @@ static int pgnWorkerMain(int argc, char **argv) {
         work.kernel.gridDim = dim3(2u * unsigned(markerSms));
         work.kernel.blockDim = dim3(512);
         work.kernel.kernelParams = args;
-        CHECK(cudaGraphAddNode(&walk, body, nullptr, 0, &work));
+        CHECK(scout_graph_add_node(&walk, body, nullptr, 0, &work));
         work.kernel.func = const_cast<void *>(selectedVerify);
         work.kernel.gridDim = dim3(16);
         work.kernel.blockDim = dim3(64);
-        CHECK(cudaGraphAddNode(&proof, body, &walk, 1, &work));
+        CHECK(scout_graph_add_node(&proof, body, &walk, 1, &work));
         // The future writer owns another bitmap version. Its write may overlap
         // this walk; advance still joins proof and future readiness. The previous
         // iteration's completed walk freed the version now reused by this writer.
@@ -1319,7 +1338,7 @@ static int pgnWorkerMain(int argc, char **argv) {
         work.kernel.gridDim = dim3(1);
         work.kernel.blockDim = dim3(1);
         work.kernel.kernelParams = advanceArgs;
-        CHECK(cudaGraphAddNode(&advance, body, dependencies, 2, &work));
+        CHECK(scout_graph_add_node(&advance, body, dependencies, 2, &work));
     }
     std::printf("[pgn-readwrite-ring] lanes=%u bitmap_slots=%u bitmap_bytes=%llu "
                 "reader_writer_disjoint=1 logical_slices_unchanged=1\n",
